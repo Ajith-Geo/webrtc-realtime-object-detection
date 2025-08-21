@@ -59,24 +59,35 @@ find_free_port() {
 }
 
 section "Prerequisite checks"
-MISSING=0
-for c in python3 python node npm ngrok; do
-  if command_exists "$c"; then
-    # capture version line safely
-    ver=$("$c" --version 2>&1 | head -n1 || true)
-    info "$c present ($ver)"
-  else
-    warn "$c missing"; ((MISSING++)) || true
-  fi
-done
 
-# Robust Python selection (avoid Windows store alias 'python3' stub message)
+# Track detailed status
+MISSING_ANY=0
+MISSING_CRITICAL=()
+
+report_tool() {
+  local tool=$1 alias_list=$2
+  local displayed=$tool
+  if [[ -n "$alias_list" ]]; then displayed="$tool ($alias_list)"; fi
+  if command_exists "$tool"; then
+    local ver; ver=$("$tool" --version 2>&1 | head -n1 || true)
+    info "$displayed present ($ver)"
+  else
+    warn "$displayed missing"
+    ((MISSING_ANY++)) || true
+  fi
+}
+
+# Raw checks (some have alternatives handled below)
+report_tool node ""
+report_tool npm ""
+report_tool ngrok ""
+
+# Robust Python selection (avoid Windows store alias stub)
 select_python() {
   local candidates=(python3 python)
   for exe in "${candidates[@]}"; do
     if command_exists "$exe"; then
       local out; out=$("$exe" --version 2>&1 || true)
-      # Skip Microsoft Store stub (contains 'was not found')
       if grep -qi 'was not found' <<<"$out"; then continue; fi
       echo "$exe"; return 0
     fi
@@ -87,11 +98,30 @@ select_python() {
 if PY=$(select_python); then
   info "Using Python interpreter candidate: $PY ($("$PY" --version 2>&1 | head -n1))"
 else
-  err "No usable Python interpreter found (python3/python)"; exit 1
+  MISSING_CRITICAL+=(Python)
 fi
 
-if (( MISSING > 0 )); then
-  warn "Some prerequisites are missing. Install them manually (e.g., via apt/brew) and re-run.";
+# Determine critical missing components (Python, node, ngrok)
+command_exists node || MISSING_CRITICAL+=(Node.js)
+command_exists ngrok || MISSING_CRITICAL+=(ngrok)
+
+if ((${#MISSING_CRITICAL[@]} > 0)); then
+  err "Missing required components: ${MISSING_CRITICAL[*]}"
+  echo
+  echo "Installation hints:" >&2
+  for comp in "${MISSING_CRITICAL[@]}"; do
+    case $comp in
+      Python)
+        echo " - Python: https://www.python.org/downloads/ (check 'Add to PATH')" >&2 ;;
+      Node.js)
+        echo " - Node.js: https://nodejs.org/en/download (LTS recommended)" >&2 ;;
+      ngrok)
+        echo " - ngrok: https://ngrok.com/download (ensure 'ngrok' in PATH)" >&2 ;;
+    esac
+  done
+  echo >&2
+  err "Terminate: install the missing dependencies then re-run this script.";
+  exit 1
 fi
 
 # ---------- ngrok authtoken ----------

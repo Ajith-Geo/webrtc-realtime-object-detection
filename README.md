@@ -14,6 +14,7 @@ A real-time object detection system using WebRTC for video streaming between dev
 ## 📋 Requirements
 
 ### System Requirements
+#### **NOTE**: PLEASE ENSURE Python, Node.js and Ngrok is INSTALLED before running the install script
 - **Python**: 3.12+ 
 - **Node.js**: 22+
 - **GPU**: NVIDIA GPU with CUDA 11.8+ (for server mode GPU acceleration)
