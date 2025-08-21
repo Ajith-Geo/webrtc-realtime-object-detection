@@ -1,8 +1,42 @@
 # WebRTC Real-Time Object Detection System - Technical Report
 
+## Tradeoffs & Known Limitations
+
+Based on the README.md documentation, the following tradeoffs and limitations exist:
+
+### **Connection Stability**
+- **First-run WebRTC connection may fail** after system boot (subsequent attempts work normally)
+- **Manual refresh workaround required** for initial connection establishment
+
+### **Metrics Collection**
+- **30-second minimum browser focus requirement** for accurate metrics collection
+- **Inconsistent results** if browser page is not kept active during benchmarking
+
+### **Resource Requirements**
+- **High system requirements**: Python 3.12+, Node.js 22+, 16GB RAM recommended
+- **GPU dependency** for optimal server mode performance (NVIDIA CUDA 11.8+)
+
+## Improvement Plan
+
+The README identifies the following planned improvements:
+
+### **Immediate Fixes**
+- [ ] **Fix 30-second minimum browser time requirement** for metrics collection
+- [ ] **Resolve first-run WebRTC connection issues**
+
+### **Feature Enhancements**
+- [ ] **Add support for multiple concurrent connections**
+- [ ] **Implement additional YOLO model variants**
+- [ ] **Enhanced metrics dashboard** for better visualization
+
+### **System Optimization**
+- [ ] **Improve connection reliability** to eliminate manual refresh workaround
+- [ ] **Optimize metrics collection** to work regardless of browser focus state
+
+
 ## Executive Summary
 
-This project implements a real-time object detection system using WebRTC for low-latency video streaming between devices, with dual inference modes: browser-based WASM inference and server-based Python inference. The system demonstrates sophisticated design choices for resource optimization, backpressure handling, and cross-device compatibility.
+The project implements a real-time object detection system using WebRTC for low-latency video streaming between devices, with dual inference modes: browser-based WASM inference and server-based Python inference. The system demonstrates sophisticated design choices for resource optimization, backpressure handling, and cross-device compatibility.
 
 ## Architecture Overview
 
@@ -305,6 +339,7 @@ for (let i = 0, p = 0; i < area; i++, p += 4) {
 }
 ```
 
+
 ## Conclusion
 
-The system successfully balances performance, compatibility, and resource efficiency through intelligent adaptive algorithms and fallback strategies. (Need some fixes though)
+The system successfully balances performance, compatibility, and resource efficiency through intelligent adaptive algorithms and fallback strategies, while acknowledging current limitations and providing a clear roadmap for improvements.

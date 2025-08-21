@@ -6,10 +6,8 @@ A real-time object detection system using WebRTC for video streaming between dev
 
 [![Demo Video](https://img.shields.io/badge/Watch-Demo%20Video-blue?style=for-the-badge&logo=loom)](https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=55400882-a987-4d13-8736-a6147e2addd6)
 
-<div>
-    <a href="https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=55400882-a987-4d13-8736-a6147e2addd6">
-    </a>
-</div>
+Video Link: https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=55400882-a987-4d13-8736-a6147e2addd6
+
 
 ## 📋 Requirements
 
@@ -20,6 +18,7 @@ A real-time object detection system using WebRTC for video streaming between dev
 - **GPU**: NVIDIA GPU with CUDA 11.8+ (for server mode GPU acceleration)
 - **RAM**: 16GB recommended
 - **OS**: Windows 10/11, macOS, or Linux
+- **BROWSER**: Latest stable version of Google Chrome or Microsoft Edge
 
 ### Test Environment
 - **CPU**: Intel i7-12700H
@@ -28,6 +27,7 @@ A real-time object detection system using WebRTC for video streaming between dev
 - **OS**: Windows 11
 - **Python**: 3.12.9
 - **Node.js**: 22.11.0
+- **BROWSER**: Latest stable version of Google Chrome and Microsoft Edge
 
 ## 🚀 Quick Start
 
