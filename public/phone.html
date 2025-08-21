@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Phone - Sender</title>
+    <style>body { font-family: Arial, sans-serif; padding: 20px;} video { width: 100%; max-width: 480px; }</style>
+  </head>
+  <body>
+    <h1>Phone - Sender</h1>
+    <video id="local" autoplay playsinline muted></video>
+    <p id="status">Initializing...</p>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const roomId = params.get('room');
+      const signalingUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  const statusEl = document.getElementById('status');
+  const ws = new WebSocket(signalingUrl);
+  let pc;
+  let pendingOutgoingCandidates = [];
+
+  ws.addEventListener('open', () => { statusEl.textContent = 'Signaling: connected'; console.log('WS open');
+    // if we have a queued join function, call it
+    if (typeof window.__sendJoin === 'function') window.__sendJoin();
+  });
+  ws.addEventListener('close', () => { statusEl.textContent = 'Signaling: closed'; console.log('WS closed'); });
+  ws.addEventListener('error', (e) => { statusEl.textContent = 'Signaling: error'; console.error('WebSocket error', e); });
+
+      async function start() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          document.getElementById('local').srcObject = stream;
+
+          // Add STUN server to help ICE when devices are on different networks
+          const config = {
+            iceServers: [
+                { urls: 'stun:74.125.250.129:19302' },
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+            ]
+           };
+          pc = new RTCPeerConnection(config);
+          stream.getTracks().forEach(t => pc.addTrack(t, stream));
+          // DataChannel to send capture timestamps (sequence + capture_ts ms)
+          const metaDc = pc.createDataChannel('capture-meta');
+          metaDc.onopen = () => {
+            console.log('capture-meta channel open');
+            // Use requestVideoFrameCallback where available for precise timestamps
+            const [videoTrack] = stream.getVideoTracks();
+            const videoEl = document.getElementById('local');
+            let seq = 0;
+            function sendFrame(ts) {
+              if (metaDc.readyState !== 'open') return;
+              const nowMs = performance.timeOrigin + performance.now(); // high-res epoch ms
+              // Use ts (DOMHighResTimeStamp relative to navigationStart) if provided
+              const captureEpochMs = (performance.timeOrigin + ts);
+              metaDc.send(JSON.stringify({ seq, capture_ts: captureEpochMs / 1000 })); // seconds epoch
+              seq++;
+            }
+            if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+              videoEl.srcObject = stream;
+              const loop = () => {
+                try { videoEl.requestVideoFrameCallback((now, meta) => { sendFrame(now); loop(); }); }
+                catch(e){ /* fallback below */ }
+              };
+              loop();
+            } else {
+              // Fallback timer approx 15fps
+              setInterval(() => { sendFrame(performance.now()); }, 66);
+            }
+          };
+
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            // If WS is open, send immediately; otherwise queue
+            if (ws.readyState === WebSocket.OPEN) {
+              try { ws.send(JSON.stringify({ type: 'ice-candidate', roomId, candidate: e.candidate })); }
+              catch (err) { console.warn('ws send ice failed', err); pendingOutgoingCandidates.push(e.candidate); }
+            } else {
+              pendingOutgoingCandidates.push(e.candidate);
+            }
+          };
+
+          pc.onconnectionstatechange = () => {
+            document.getElementById('status').textContent = 'Connection state: ' + pc.connectionState;
+          };
+
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          // function to send join; stored on window so ws.open handler can call it
+          window.__sendJoin = () => {
+            try {
+              ws.send(JSON.stringify({ type: 'join', roomId, offer: pc.localDescription }));
+              console.log('Sent join with offer');
+              // flush any queued outgoing ICE candidates
+              if (pendingOutgoingCandidates.length) {
+                for (const c of pendingOutgoingCandidates) ws.send(JSON.stringify({ type: 'ice-candidate', roomId, candidate: c }));
+                pendingOutgoingCandidates = [];
+              }
+            } catch (e) { console.warn('Failed to send join', e); }
+          };
+          // if ws already open, send now
+          if (ws.readyState === WebSocket.OPEN) window.__sendJoin();
+
+          ws.addEventListener('message', async (ev) => {
+            const data = JSON.parse(ev.data);
+            if (data.type === 'answer') {
+              try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                document.getElementById('status').textContent = 'Streaming to laptop';
+              } catch (e) { console.error('Failed to set remote desc', e); }
+            }
+
+            if (data.type === 'ice-candidate') {
+              try { await pc.addIceCandidate(data.candidate); } catch (e) { console.warn('addIceCandidate error', e); }
+            }
+          });
+        } catch (err) {
+          console.error('getUserMedia error', err);
+          document.getElementById('status').textContent = 'Camera error: ' + (err.message || err.name);
+        }
+      }
+
+      if (roomId) start(); else document.getElementById('status').textContent = 'No room found in URL';
+    </script>
+  </body>
+</html>

@@ -1,0 +1,598 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Laptop - Receiver</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+
+    video {
+      width: 640px;
+      height: 480px;
+      background: #000;
+    }
+
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    #qr {
+      margin-top: 10px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Laptop - Receiver</h1>
+  <div style="position:relative; display:inline-block;">
+    <video id="video" autoplay playsinline muted
+      style="display:block; max-width:100%; height:auto; background:#000;"></video>
+    <canvas id="overlay" style="position:absolute;left:0;top:0;pointer-events:none;"></canvas>
+  </div>
+  <div id="qr"></div>
+  <script>
+    async function fetchWithRetry(url, options, retries = 3, delay = 500) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                const res = await fetch(url, options);
+                if (res.status >= 400 && res.status < 500) { // Don't retry on client errors
+                    throw new Error(`Client error fetching ${url}: ${res.status}`);
+                }
+                if (!res.ok) {
+                    throw new Error(`Server error fetching ${url}: ${res.status}`);
+                }
+                return res;
+            } catch (error) {
+                console.warn(`Fetch attempt ${i + 1} failed:`, error.message);
+                if (i < retries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+    const signalingUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+    const ws = new WebSocket(signalingUrl);
+    let roomId;
+    let pc;
+    const pendingCandidates = [];
+    let inferenceLoopRunning = false;
+    const iceConfig = {
+      iceServers: [
+        { urls: 'stun:74.125.250.129:19302' },
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+      ]
+    };
+    // Benchmarking state
+    const bench = {
+      mode: null,
+      startTs: null,
+      frameCount: 0,
+      latencies: [], // (recv_ts - capture_ts) seconds
+      lastFpsSampleTime: null,
+      posted: false,
+      maxDurationSec: 30,
+  // Debug / audit fields for server mode latency correction
+  _rawOffsets: [], // raw recv_ts - capture_ts (s) limited size
+  _baseline: null, // running minimum raw offset (s)
+  _baselineFrozen: false,
+  _baselineFreezeAfter: 12, // samples after which we stop lowering baseline (avoid zero inflation)
+  corrected_latencies_ms: [],
+  inference_ms: [],
+  capture_to_recv_ms: [],
+  recv_to_infer_start_ms: [],
+  recv_to_infer_end_ms: [],
+  render_delay_ms: [],
+  dropped_negative: 0,
+    };
+
+    // Benchmark finalize helper (defined early to avoid ReferenceError before async code paths call it)
+    function maybeFinishBenchmark() {
+      if (!bench.startTs) return; // not started yet
+      if (bench.posted) return;
+      const elapsed = (performance.now() - bench.startTs) / 1000;
+      if (elapsed >= bench.maxDurationSec) {
+        bench.posted = true;
+        const sorted = [...bench.latencies].sort((a, b) => a - b);
+        function percentile(p) { if (!sorted.length) return null; const idx = Math.min(sorted.length - 1, Math.floor(p / 100 * (sorted.length - 1))); return sorted[idx]; }
+        const median = percentile(50);
+        const p95 = percentile(95);
+        const fps = bench.frameCount / elapsed;
+  const payload = { mode: bench.mode, duration_s: elapsed, frames: bench.frameCount, fps, median_latency_ms: median, p95_latency_ms: p95, latencies_ms: bench.latencies };
+        console.log('Benchmark complete', payload);
+        fetch('/metrics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(e => console.warn('Metrics post failed', e));
+      }
+    }
+
+    const statusEl = document.createElement('p');
+    statusEl.id = 'ws-status';
+    statusEl.textContent = 'Signaling: connecting...';
+    document.body.appendChild(statusEl);
+
+    ws.addEventListener('open', () => {
+      statusEl.textContent = 'Signaling: connected';
+      ws.send(JSON.stringify({ type: 'create' }));
+    });
+
+    ws.addEventListener('close', () => { statusEl.textContent = 'Signaling: closed'; });
+    ws.addEventListener('error', (e) => { statusEl.textContent = 'Signaling: error'; console.error(e); });
+
+    ws.addEventListener('message', async (ev) => {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'created') {
+        roomId = data.roomId;
+        // show QR with URL to join from phone
+        const joinUrl = `${location.origin}/phone.html?room=${roomId}`;
+        const img = document.createElement('img');
+        img.src = `/qr?data=${encodeURIComponent(joinUrl)}`;
+        img.alt = 'QR Code';
+        img.width = 200; img.height = 200;
+        document.getElementById('qr').appendChild(img);
+        // Also show the plain join URL so the user can type it if the QR scanner drops the querystring
+        const p = document.createElement('p');
+        p.style.wordBreak = 'break-all';
+        p.textContent = 'Join URL: ' + joinUrl;
+        document.getElementById('qr').appendChild(p);
+      }
+
+      if (data.type === 'join-request') {
+        if (pc) {
+            console.warn('Closing previous PeerConnection before creating a new one.');
+            pc.close();
+            pc = null;
+        }
+        if (inferenceLoopRunning) {
+            console.warn('Stopping previous inference loop.');
+            inferenceLoopRunning = false;
+        }
+        console.log('Received join-request (offer) from guest');
+        // Create RTCPeerConnection WITH STUN (symmetry w/ sender) for better NAT traversal
+        pc = new RTCPeerConnection(iceConfig);
+
+        // We'll build our own MediaStream so we can add tracks incrementally & retry playback
+        const videoEl = document.getElementById('video');
+        const remoteComposite = new MediaStream();
+        videoEl.srcObject = remoteComposite; // set early
+
+        // Helper to attempt playback (autoplay sometimes flaky when created programmatically)
+        async function ensurePlay(tag = videoEl) {
+          if (!tag) return;
+          try {
+            // Muted improves autoplay success in Chromium/Edge
+            tag.muted = true;
+            await tag.play();
+          } catch (err) { console.warn('video.play() blocked (likely autoplay policy):', err); }
+        }
+
+        // Simple click-to-start fallback overlay if autoplay blocked
+        let clickOverlay; // created only if needed
+        function showClickOverlay() {
+          if (clickOverlay) return;
+          // Show overlay if video is paused OR no current frame rendered yet
+          if (!videoEl.paused && videoEl.readyState >= 2) return; // already playing
+          clickOverlay = document.createElement('div');
+          clickOverlay.textContent = 'Tap / Click to start video';
+          Object.assign(clickOverlay.style, { position: 'absolute', left: videoEl.offsetLeft + 'px', top: videoEl.offsetTop + 'px', width: videoEl.clientWidth + 'px', height: videoEl.clientHeight + 'px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.55)', color: '#fff', fontSize: '20px', cursor: 'pointer', backdropFilter: 'blur(2px)' });
+          clickOverlay.addEventListener('click', async () => { await ensurePlay(); setTimeout(() => { if (!videoEl.paused) clickOverlay.remove(); }, 150); });
+          document.body.appendChild(clickOverlay);
+        }
+
+        pc.ontrack = (ev) => {
+          console.log('[receiver] ontrack kind=%s id=%s', ev.track.kind, ev.track.id);
+          // Safari sometimes gives empty ev.streams; always ensure we add the track
+          remoteComposite.addTrack(ev.track);
+          // Attempt playback once metadata is available
+          ensurePlay();
+        };
+
+        videoEl.addEventListener('loadedmetadata', () => { console.log('[receiver] video metadata loaded'); ensurePlay(); });
+        videoEl.addEventListener('canplay', () => { console.log('[receiver] video canplay'); });
+        videoEl.addEventListener('error', (e) => { console.warn('[receiver] video tag error', e); });
+        // Periodically check if we need a click overlay (in case autoplay blocked silently)
+        let autoplayCheckCount = 0;
+        const autoplayInterval = setInterval(() => {
+          autoplayCheckCount++;
+          if (!videoEl.paused) { clearInterval(autoplayInterval); if (clickOverlay) try { clickOverlay.remove(); } catch (_) { }; return; }
+          if (autoplayCheckCount <= 10) showClickOverlay(); else clearInterval(autoplayInterval);
+        }, 700);
+
+        pc.onicecandidate = (e) => {
+          if (e.candidate) {
+            ws.send(JSON.stringify({ type: 'ice-candidate', roomId, candidate: e.candidate }));
+          }
+        };
+        pc.onconnectionstatechange = () => {
+          console.log('PC connection state:', pc.connectionState);
+        };
+        pc.onicegatheringstatechange = () => {
+            console.log('PC ICE gathering state:', pc.iceGatheringState);
+        };
+        pc.onicecandidateerror = (e) => {
+            console.error('PC ICE candidate error:', e);
+        };
+
+        console.log('Setting remote description');
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: data.offer.sdp }));
+        console.log('Creating answer');
+        const answer = await pc.createAnswer();
+        console.log('Setting local description');
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', roomId, answer: pc.localDescription }));
+
+        // Flush any ICE candidates queued while we were setting up
+        if (pendingCandidates.length) {
+          console.log('Flushing', pendingCandidates.length, 'pending ICE candidates');
+          for (const c of pendingCandidates) {
+            try { await pc.addIceCandidate(c); } catch (e) { console.warn('Error adding flushed candidate', e); }
+          }
+          pendingCandidates.length = 0;
+        }
+
+        // After remote track(s) arrive, decide what to do based on mode.
+        const res = await fetchWithRetry('/mode');
+        const { mode } = await res.json();
+        console.log('Operating mode:', mode);
+        bench.mode = mode;
+        bench.startTs = performance.now();
+        bench.lastFpsSampleTime = bench.startTs;
+
+        if (mode === 'wasm') {
+          document.getElementById('ws-status').textContent = 'Mode: WASM (client-side inference)';
+          // Wait for video to be ready before starting inference
+          videoEl.addEventListener('canplay', () => {
+            if (!inferenceLoopRunning) {
+                inferenceLoopRunning = true;
+                runWasmInference();
+            }
+          }, { once: true });
+        } else { // mode === 'server'
+          document.getElementById('ws-status').textContent = 'Mode: Server (python inference)';
+          // Forward to Python.
+          const pythonUrl = 'http://localhost:8080/offer';
+          (async () => {
+            try {
+              // Wait briefly for at least one track
+              const waitStart = performance.now();
+              while (remoteComposite.getVideoTracks().length === 0 && performance.now() - waitStart < 5000) {
+                await new Promise(r => setTimeout(r, 100));
+              }
+              const vids = remoteComposite.getVideoTracks();
+              if (!vids.length) { console.warn('No video tracks to forward to python'); return; }
+              const pc2 = new RTCPeerConnection(iceConfig);
+              const fwdStream = new MediaStream(vids);
+              fwdStream.getTracks().forEach(t => pc2.addTrack(t, fwdStream));
+              const dc = pc2.createDataChannel('from-python'); // python -> detections
+              const metaOut = pc2.createDataChannel('capture-meta-forward'); // forward capture_ts to python
+              const overlay = document.getElementById('overlay');
+              const ctx = overlay.getContext('2d');
+              function syncOverlaySize() {
+                // Match overlay CSS size to displayed video box size
+                const bw = videoEl.clientWidth;
+                const bh = videoEl.clientHeight;
+                if (overlay.width !== bw || overlay.height !== bh) {
+                  overlay.width = bw; overlay.height = bh;
+                }
+                overlay.style.width = bw + 'px';
+                overlay.style.height = bh + 'px';
+              }
+              const resizeObserver = new ResizeObserver(() => syncOverlaySize());
+              resizeObserver.observe(videoEl);
+              window.addEventListener('resize', syncOverlaySize);
+              // Maintain small detection buffer keyed by capture_ts (seconds)
+              const detectionBuffer = new Map();
+              let lastDrawnTs = 0;
+              function drawDetections(payload) {
+                if (!payload || !payload.detections) return;
+                if (typeof payload.capture_ts === 'number') {
+                  detectionBuffer.set(payload.capture_ts, payload);
+                }
+                // choose the most recent detection not older than ~1s
+                const now = performance.now() / 1000;
+                // purge old
+                for (const [k] of detectionBuffer) { if (now - k > 2) detectionBuffer.delete(k); }
+                // find best candidate (max timestamp <= now)
+                let candidateTs = null;
+                for (const k of detectionBuffer.keys()) { if (candidateTs === null || k > candidateTs) candidateTs = k; }
+                if (candidateTs == null) return;
+                const usePayload = detectionBuffer.get(candidateTs);
+                lastDrawnTs = candidateTs;
+                const payloadToDraw = usePayload;
+                syncOverlaySize();
+                const boxW = overlay.width, boxH = overlay.height;
+                const vidW = videoEl.videoWidth || boxW; const vidH = videoEl.videoHeight || boxH;
+                // Letterbox calculation (object-fit: contain behavior)
+                const scale = Math.min(boxW / vidW, boxH / vidH);
+                const contentW = vidW * scale; const contentH = vidH * scale;
+                const offX = (boxW - contentW) / 2; const offY = (boxH - contentH) / 2;
+                ctx.clearRect(0, 0, boxW, boxH);
+                ctx.font = '14px sans-serif'; ctx.lineWidth = 2; ctx.textBaseline = 'top';
+                payloadToDraw.detections.forEach(det => {
+                  const x1 = offX + det.xmin * contentW;
+                  const y1 = offY + det.ymin * contentH;
+                  const x2 = offX + det.xmax * contentW;
+                  const y2 = offY + det.ymax * contentH;
+                  ctx.strokeStyle = '#00FF00';
+                  ctx.fillStyle = 'rgba(0,255,0,0.15)';
+                  ctx.beginPath(); ctx.rect(x1, y1, x2 - x1, y2 - y1); ctx.fill(); ctx.stroke();
+                  const label = `${det.label} ${(det.score * 100).toFixed(1)}%`;
+                  const tw = ctx.measureText(label).width + 10; const th = 18;
+                  ctx.fillStyle = '#00FF00';
+                  ctx.fillRect(x1, Math.max(0, y1 - th), tw, th);
+                  ctx.fillStyle = '#000';
+                  ctx.fillText(label, x1 + 4, Math.max(0, y1 - th + 2));
+                });
+              }
+              dc.onmessage = (ev) => {
+                let payload = null;
+                try {
+                  payload = JSON.parse(ev.data);
+                  console.log('Detection payload', payload);
+                  drawDetections(payload);
+                } catch (e) {
+                  console.warn('Bad detection message', e);
+                }
+                // Initialize benchmark timing late if needed
+                if (!bench.startTs) {
+                  bench.startTs = performance.now();
+                  bench.lastFpsSampleTime = bench.startTs;
+                }
+                // Collect latency metrics when available (server mode only)
+                if (bench.mode === 'server' && payload && typeof payload.capture_ts === 'number' && typeof payload.recv_ts === 'number') {
+                  // Cross-device offset removal (transparent, no faking):
+                  // rawOffset = recv_ts(laptop/python) - capture_ts(phone). This equals clock_skew + true_pipeline_latency.
+                  // We approximate clock_skew as the RUNNING MINIMUM of rawOffset (pipeline latency can't be negative).
+                  const rawOffset = payload.recv_ts - payload.capture_ts; // seconds
+                  if (rawOffset > 0 && rawOffset < 120) { // sanity range
+                    // Track raw offsets (limit length to prevent unbounded growth)
+                    bench._rawOffsets.push(rawOffset);
+                    if (bench._rawOffsets.length > 200) bench._rawOffsets.shift();
+                    // Update baseline only if not frozen
+                    if (!bench._baselineFrozen) {
+                      if (bench._baseline === null || rawOffset < bench._baseline) bench._baseline = rawOffset;
+                      if (bench._rawOffsets.length >= bench._baselineFreezeAfter) bench._baselineFrozen = true;
+                    }
+                    if (bench._baseline !== null) {
+                      let corrected = (rawOffset - bench._baseline) * 1000.0; // ms (clock skew removed)
+                      if (corrected < 0) { bench.dropped_negative++; return; }
+                      if (corrected < 5000) {
+                        bench.latencies.push(corrected);
+                        bench.corrected_latencies_ms.push(corrected);
+                      }
+                    }
+                  }
+                  bench.frameCount++;
+                  maybeFinishBenchmark();
+                  // Collect breakdown metrics if python provided auxiliary timestamps
+                  const arrNow = performance.now();
+                  if (typeof payload.inference_ts === 'number' && typeof payload.recv_ts === 'number') {
+                    const inferDur = (payload.inference_ts - (payload.inference_start_ts || payload.recv_ts)) * 1000.0;
+                    if (inferDur > 0 && inferDur < 5000) bench.inference_ms.push(inferDur);
+                    const capToRecv = (payload.recv_ts - payload.capture_ts) * 1000.0; // includes skew before correction
+                    if (capToRecv > 0 && capToRecv < 60000) bench.capture_to_recv_ms.push(capToRecv);
+                    if (payload.inference_start_ts) {
+                      const recvToInferStart = (payload.inference_start_ts - payload.recv_ts) * 1000.0;
+                      if (recvToInferStart > -5 && recvToInferStart < 5000) bench.recv_to_infer_start_ms.push(recvToInferStart);
+                    }
+                    const recvToInferEnd = (payload.inference_ts - payload.recv_ts) * 1000.0;
+                    if (recvToInferEnd > 0 && recvToInferEnd < 5000) bench.recv_to_infer_end_ms.push(recvToInferEnd);
+                    const displayDelay = performance.now() - arrNow; // minimal (render sync placeholder)
+                    if (displayDelay >= 0 && displayDelay < 100) bench.render_delay_ms.push(displayDelay);
+                  }
+                }
+              };
+              // Forward capture_ts from original peer if available
+              const metaIn = pc.createDataChannel ? null : null; // placeholder
+              // Listen for capture-meta channel on original connection (guest->host)
+              pc.ondatachannel = (ev) => {
+                if (ev.channel.label === 'capture-meta') {
+                  const ch = ev.channel;
+                  ch.onmessage = (mev) => {
+                    if (metaOut.readyState === 'open') metaOut.send(mev.data);
+                  };
+                }
+              };
+              dc.onopen = () => console.log('Python datachannel open');
+              const offer2 = await pc2.createOffer();
+              await pc2.setLocalDescription(offer2);
+              const res = await fetch(pythonUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sdp: pc2.localDescription.sdp, type: pc2.localDescription.type }) });
+              const ans = await res.json();
+              await pc2.setRemoteDescription(new RTCSessionDescription(ans));
+              console.log('Forwarding stream to python server');
+            } catch (e) { console.warn('Failed to create pc2 to python', e); }
+          })();
+        }
+      }
+
+      if (data.type === 'ice-candidate') {
+        if (!pc || !pc.remoteDescription) {
+          // store candidate until pc is created and remote description is set
+          pendingCandidates.push(data.candidate);
+        } else {
+          try { await pc.addIceCandidate(data.candidate); } catch (e) { console.warn('addIceCandidate error', e); }
+        }
+      }
+    });
+
+    async function runWasmInference() {
+      const videoEl = document.getElementById('video');
+      const overlay = document.getElementById('overlay');
+      const ctx = overlay.getContext('2d', { willReadFrequently: true });
+
+      // Load ONNX model
+      statusEl.textContent = "Loading model...";
+      try { if (ort?.env?.wasm) { ort.env.wasm.numThreads = Math.min(6, Math.max(2, navigator.hardwareConcurrency || 4)); ort.env.wasm.simd = true; } }
+      catch (e) { console.warn('ORT WASM env config failed', e); }
+      let session; const providerAttempts = [['webgpu', 'wasm'], ['webgl', 'wasm'], ['wasm']];
+      for (const providers of providerAttempts) {
+        try { session = await ort.InferenceSession.create('./yolov8n.onnx', { executionProviders: providers }); console.log('Using ORT providers:', providers); break; }
+        catch (e) { console.warn('Provider set failed', providers, e); }
+      }
+      if (!session) session = await ort.InferenceSession.create('./yolov8n.onnx');
+      const outputName = session.outputNames[0]; // Get the actual output name
+      statusEl.textContent = "Model loaded. Starting inference loop.";
+
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+      const inputSize = { w: 640, h: 640 };
+      const area = inputSize.w * inputSize.h;
+      const preprocessedData = new Float32Array(area * 3);
+      const reusableTensor = new ort.Tensor('float32', preprocessedData, [1, 3, inputSize.h, inputSize.w]);
+      tempCanvas.width = inputSize.w;
+      tempCanvas.height = inputSize.h;
+      let letterbox = { scale: 1, padX: 0, padY: 0, vidW: 0, vidH: 0 };
+
+      function syncOverlaySize() {
+        const overlay = document.getElementById('overlay');
+        const videoW = videoEl.clientWidth;
+        const videoH = videoEl.clientHeight;
+        if (overlay.width !== videoW || overlay.height !== videoH) {
+          overlay.width = videoW; overlay.height = videoH;
+        }
+      }
+      window.addEventListener('resize', syncOverlaySize);
+
+      let targetIntervalMs = 0;
+      async function processFrame() {
+        if (!inferenceLoopRunning) {
+            console.log('Inference loop stopped.');
+            return;
+        }
+        if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
+          requestAnimationFrame(processFrame); return;
+        }
+        syncOverlaySize();
+        // Compute letterbox parameters (preserve aspect inside square 640x640)
+        const vidW = videoEl.videoWidth;
+        const vidH = videoEl.videoHeight;
+        const scaleIn = Math.min(inputSize.w / vidW, inputSize.h / vidH);
+        const newW = vidW * scaleIn;
+        const newH = vidH * scaleIn;
+        const padX = (inputSize.w - newW) / 2;
+        const padY = (inputSize.h - newH) / 2;
+        letterbox = { scale: scaleIn, padX, padY, vidW, vidH };
+
+        // 1. Draw letterboxed frame
+        tempCtx.fillStyle = '#000';
+        tempCtx.fillRect(0, 0, inputSize.w, inputSize.h);
+        tempCtx.drawImage(videoEl, 0, 0, vidW, vidH, padX, padY, newW, newH);
+        const imageData = tempCtx.getImageData(0, 0, inputSize.w, inputSize.h);
+
+        // 2. Inline preprocessing into reusable buffer (NCHW, normalized 0..1)
+        const px = imageData.data; // RGBA
+        for (let i = 0, p = 0; i < area; i++, p += 4) {
+          preprocessedData[i] = px[p] * (1 / 255);
+          preprocessedData[i + area] = px[p + 1] * (1 / 255);
+          preprocessedData[i + 2 * area] = px[p + 2] * (1 / 255);
+        }
+
+        // 3. Run inference
+        const feeds = { images: reusableTensor };
+        const tInfer0 = performance.now();
+        const results = await session.run(feeds);
+        const tInfer1 = performance.now();
+        const inferMs = tInfer1 - tInfer0;
+
+        // 4. Process output and draw
+        const outputTensor = results[outputName];
+        drawWasmDetections(outputTensor, document.getElementById('overlay'), videoEl, letterbox);
+        // Collect local inference latency (WASM) and FPS samples
+        bench.frameCount++;
+        if (bench.mode === 'wasm') {
+          const inferLatencyMs = inferMs;
+          if (inferLatencyMs > 0 && inferLatencyMs < 60000) bench.latencies.push(inferLatencyMs);
+          maybeFinishBenchmark();
+        }
+
+        // 5. Adaptive loop pacing: allow some idle between runs (~20% of inference time), cap at 50ms
+        targetIntervalMs = inferMs * 0.15; // slightly tighter
+        const delay = Math.min(25, Math.max(0, targetIntervalMs));
+        setTimeout(() => requestAnimationFrame(processFrame), delay);
+      }
+
+      requestAnimationFrame(processFrame);
+    }
+
+    // removed old preprocess (inlined for speed)
+
+    function drawWasmDetections(outputTensor, canvas, video, letterbox) {
+      if (!outputTensor) return;
+      const confidenceThreshold = 0.45;
+      const iouThreshold = 0.45; // NMS IoU threshold
+      const coco_classes = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'];
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+
+      // (maybeFinishBenchmark already defined above)
+      const data = outputTensor.data; // shape [1,84,8400] flattened
+      const numProps = 8400; const strideCls = numProps;
+      const { scale, padX, padY, vidW, vidH } = letterbox;
+      const rawBoxes = [];
+      for (let i = 0; i < numProps; i++) {
+        let bestScore = confidenceThreshold; let bestClass = -1;
+        for (let c = 4; c < 84; c++) {
+          const s = data[c * strideCls + i];
+          if (s > bestScore) { bestScore = s; bestClass = c - 4; }
+        }
+        if (bestClass === -1) continue;
+        const xc = data[0 * strideCls + i];
+        const yc = data[1 * strideCls + i];
+        const w = data[2 * strideCls + i];
+        const h = data[3 * strideCls + i];
+        // letterbox -> original video coords
+        let x1 = (xc - w / 2 - padX) / scale; let y1 = (yc - h / 2 - padY) / scale;
+        let x2 = (xc + w / 2 - padX) / scale; let y2 = (yc + h / 2 - padY) / scale;
+        x1 = Math.max(0, Math.min(vidW, x1)); y1 = Math.max(0, Math.min(vidH, y1));
+        x2 = Math.max(0, Math.min(vidW, x2)); y2 = Math.max(0, Math.min(vidH, y2));
+        if (x2 - x1 < 4 || y2 - y1 < 4) continue;
+        rawBoxes.push({ x1, y1, x2, y2, score: bestScore, classId: bestClass });
+      }
+
+      function iou(a, b) {
+        const interX1 = Math.max(a.x1, b.x1); const interY1 = Math.max(a.y1, b.y1);
+        const interX2 = Math.min(a.x2, b.x2); const interY2 = Math.min(a.y2, b.y2);
+        const iw = Math.max(0, interX2 - interX1); const ih = Math.max(0, interY2 - interY1);
+        const inter = iw * ih; if (!inter) return 0;
+        const areaA = (a.x2 - a.x1) * (a.y2 - a.y1); const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+        return inter / (areaA + areaB - inter);
+      }
+      function nms(boxes) {
+        const out = []; boxes.sort((a, b) => b.score - a.score);
+        while (boxes.length) {
+          const first = boxes.shift(); out.push(first);
+          for (let i = boxes.length - 1; i >= 0; i--) {
+            if (boxes[i].classId === first.classId && iou(first, boxes[i]) > iouThreshold) { boxes.splice(i, 1); }
+          }
+        }
+        return out;
+      }
+      const finalBoxes = nms(rawBoxes);
+
+      // Draw
+      const dispW = video.clientWidth; const dispH = video.clientHeight;
+      const scaleX = dispW / vidW; const scaleY = dispH / vidH;
+      ctx.font = '14px sans-serif'; ctx.textBaseline = 'top';
+      finalBoxes.forEach(det => {
+        const x = det.x1 * scaleX; const y = det.y1 * scaleY; const w = (det.x2 - det.x1) * scaleX; const h = (det.y2 - det.y1) * scaleY;
+        ctx.strokeStyle = '#00FF00'; ctx.lineWidth = 2; ctx.beginPath(); ctx.rect(x, y, w, h); ctx.stroke();
+        const label = `${coco_classes[det.classId]} ${(det.score * 100).toFixed(1)}%`;
+        const tw = ctx.measureText(label).width + 8; const th = 18;
+        ctx.fillStyle = 'rgba(0,255,0,0.85)'; ctx.fillRect(x, Math.max(0, y - th), tw, th);
+        ctx.fillStyle = '#000'; ctx.fillText(label, x + 4, Math.max(0, y - th + 2));
+      });
+    }
+
+  </script>
+</body>
+
+</html>
