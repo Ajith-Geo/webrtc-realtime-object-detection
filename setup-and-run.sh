@@ -41,7 +41,7 @@ is_port_in_use() {
   if command_exists lsof; then
     lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0 || return 1
   fi
-  # Try netstat (Windows / general)
+  # Try netstat
   if command_exists netstat; then
     netstat -an 2>/dev/null | grep -E "[:.]$port +LISTEN" >/dev/null 2>&1 && return 0 || return 1
   fi
@@ -97,20 +97,11 @@ fi
 # ---------- ngrok authtoken ----------
 if command_exists ngrok; then
   section "ngrok auth token"
-  # Detect token (supports ngrok v3 config path)
-  if ngrok config get-authtoken >/dev/null 2>&1; then
-    info "ngrok auth token already configured"
+  info "Forcing ngrok auth token configuration"
+  if ngrok config add-authtoken 31TCv0ZqBRxpzDjug3bWCcOmlTV_42qafSCBiHT9WR28tgF5H >/dev/null 2>&1; then
+    info "ngrok auth token set/overwritten"
   else
-    read -r -p "Enter ngrok auth token (leave blank to skip): " NGROK_TOKEN || true
-    if [[ -n "${NGROK_TOKEN:-}" ]]; then
-      if ngrok config add-authtoken "$NGROK_TOKEN" >/dev/null 2>&1; then
-        info "ngrok token configured"
-      else
-        warn "Failed to set ngrok token (continuing without)"
-      fi
-    else
-      warn "Skipping ngrok token configuration"
-    fi
+    warn "Failed to set ngrok auth token"
   fi
 fi
 
