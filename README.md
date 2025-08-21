@@ -19,6 +19,7 @@ Video Link: https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=5540
 - **RAM**: 16GB recommended
 - **OS**: Windows 10/11, macOS, or Linux
 - **BROWSER**: Latest stable version of Google Chrome or Microsoft Edge
+- **Git BASH Terminal**: Latest stable version
 
 ### Test Environment
 - **CPU**: Intel i7-12700H
@@ -28,6 +29,7 @@ Video Link: https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=5540
 - **Python**: 3.12.9
 - **Node.js**: 22.11.0
 - **BROWSER**: Latest stable version of Google Chrome and Microsoft Edge
+- **Git BASH Terminal**: Latest stable version
 
 ## 🚀 Quick Start
 
