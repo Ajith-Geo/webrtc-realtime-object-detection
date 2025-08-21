@@ -348,7 +348,6 @@
                 }
                 // Collect latency metrics when available (server mode only)
                 if (bench.mode === 'server' && payload && typeof payload.capture_ts === 'number' && typeof payload.recv_ts === 'number') {
-                  // Cross-device offset removal (transparent, no faking):
                   // rawOffset = recv_ts(laptop/python) - capture_ts(phone). This equals clock_skew + true_pipeline_latency.
                   // We approximate clock_skew as the RUNNING MINIMUM of rawOffset (pipeline latency can't be negative).
                   const rawOffset = payload.recv_ts - payload.capture_ts; // seconds

@@ -79,6 +79,7 @@ This script will:
 - **Metrics are automatically saved** to `metrics.json` in the root directory
 
 ## 📊 Metrics and Benchmarking
+> ⏱️ **Benchmarking is automatic.** No separate script to run. A 30‑second metrics window starts the moment the first detection/overlay appears. Keep the laptop page (with the video + overlay) focused and open for the full 30 seconds or results may be incomplete/inconsistent.
 
 The application automatically collects performance metrics including:
 
