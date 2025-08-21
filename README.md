@@ -31,9 +31,13 @@ Video Link: https://www.loom.com/share/f5b1039967a8466ea81c81f63e833d30?sid=5540
 
 ## 🚀 Quick Start
 
-### One-Command Installation (Windows with Git Bash, Recommended mode of Installation)
+### One-Command Installation (Windows with Git Bash Terminal, Recommended mode of Installation)
 
-```bash
+```python
+git clone https://github.com/Ajith-Geo/webrtc-realtime-object-detection.git
+
+cd webrtc-realtime-object-detection
+
 chmod +x setup-and-run.sh
 ./setup-and-run.sh
 ```
