@@ -30,6 +30,34 @@ err()  { echo "$(red "[ERR ]") $*" >&2; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Fixed header display (pins URL at top using scroll region)
+show_fixed_header() {
+  local url="$1"
+  local laptop_url="${url%/}/laptop.html"
+  local lines bottom
+  lines=$(tput lines 2>/dev/null || echo 50)
+  bottom=$lines
+  # Clear screen & home cursor
+  printf '\033[2J\033[H'
+  # We want header (URL + label) plus 4 blank spacer lines fixed.
+  # Header content currently uses 4 lines; add 4 spacer lines => reserve 8 total.
+  local reserved=8
+  local scroll_start=$((reserved + 1))
+  if (( scroll_start >= bottom )); then
+    scroll_start=9  # fallback sane default
+  fi
+  printf '\033[%d;%sr' "$scroll_start" "$bottom"
+  bold() { printf '\033[1m%s\033[0m' "$*"; }
+  cyan() { printf '\033[36m%s\033[0m' "$*"; }
+  printf '%s\n' "$(bold '================= ACCESS URL =================')"
+  printf '%s ' "$(bold 'Click on this URL:')"
+  printf '%s\n' "$(cyan "$laptop_url")"
+  printf '\n\n\n\n'
+  printf '%s\n' "(Header fixed. Logs will appear below.)"
+  # Spacer lines (4)
+  HEADER_ACTIVATED=1
+}
+
 # ---- network helpers ----
 is_port_in_use() {
   local port=$1
@@ -299,9 +327,14 @@ if command_exists ngrok; then
     fi
   done
   if [[ -n "$NGROK_URL" ]]; then
-    echo
-    echo "$(green 'NGROK PUBLIC URL:') $NGROK_URL"
-    echo "Open ${NGROK_URL}/laptop.html on your laptop and scan QR with phone.";
+    # Clear previous logs & pin header
+    if [[ -t 1 ]]; then
+      show_fixed_header "$NGROK_URL"
+    else
+      echo
+      echo "$(green 'NGROK PUBLIC URL:') $NGROK_URL"
+      echo "Laptop: ${NGROK_URL}/laptop.html"
+    fi
   else
     warn "Failed to detect ngrok https URL (check http://127.0.0.1:4040)"
   fi
@@ -320,6 +353,10 @@ cleanup() {
       if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fi
     fi
   done
+  # Reset full scroll region & clear header
+  if [[ -n "${HEADER_ACTIVATED:-}" && -t 1 ]]; then
+    printf '\033[r\033[2J\033[H'
+  fi
   info "All processes terminated. Bye."
 }
 trap cleanup INT TERM EXIT

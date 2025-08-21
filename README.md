@@ -38,6 +38,15 @@ chmod +x setup-and-run.sh
 ./setup-and-run.sh
 ```
 
+> ⚠️ **FIRST-RUN WEBRTC CONNECTION WARNING**  
+> The very first connection attempt after a system boot may fail (subsequent attempts work normally). If the phone video/connection does not establish:  
+> 1. **Refresh the phone page first**.  
+> 2. Still failing? **Refresh the laptop page**, scan the newly generated QR code again.  
+> 3. After one successful pairing, later sessions are stable.  
+> _Status: Known issue under investigation; temporary manual refresh workaround._
+
+
+
 This script will:
 - Verify dependencies (Python, Node.js, ngrok)
 - Set up virtual environment
